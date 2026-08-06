@@ -8,7 +8,7 @@ dynamic = ["version"]
 description = "An interactive terminal torrent client built on libtorrent and Textual."
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 authors = [{ name = "Romain Hedouin" }]
 keywords = ["torrent", "libtorrent", "tui", "textual", "bittorrent"]
 classifiers = [
@@ -18,6 +18,10 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Communications :: File Sharing",
 ]
 dependencies = [
@@ -46,6 +50,7 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 100
 src = ["src", "tests"]
+target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

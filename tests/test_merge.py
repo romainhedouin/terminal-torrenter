@@ -5,6 +5,7 @@ add_torrent_params, so SessionManager folds the announces in by hand.
 """
 
 import os
+import time
 
 import libtorrent as lt
 import pytest
@@ -50,6 +51,18 @@ def manager(tmp_path):
     mgr.session.pause()
 
 
+def wait_for_resume(manager, tid, timeout=10.0):
+    """Pump alerts until the resume blob for `tid` is on disk; return its path."""
+    path = os.path.join(manager.store.directory, tid + ".resume")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        manager.pump_alerts()
+        if os.path.isfile(path):
+            return path
+        time.sleep(0.02)
+    raise AssertionError(f"resume data for {tid} never arrived within {timeout}s")
+
+
 def trackers_of(manager, tid):
     return sorted(entry["url"] for entry in manager.torrents[tid].handle.trackers())
 
@@ -78,11 +91,7 @@ def test_merge_survives_the_resume_data_path(manager, tmp_path):
     """A re-add after a checkpoint takes the resume branch; merge still applies."""
     tid = manager.add_source(magnet(trackers=["udp://a:80"]))
     manager.request_checkpoints()
-    for _ in range(50):
-        manager.pump_alerts()
-        if os.path.isfile(os.path.join(manager.store.directory, tid + ".resume")):
-            break
-    assert os.path.isfile(os.path.join(manager.store.directory, tid + ".resume"))
+    wait_for_resume(manager, tid)
 
     manager.add_source(magnet(trackers=["udp://c:80"]))
     assert trackers_of(manager, tid) == ["udp://a:80", "udp://c:80"]
@@ -91,12 +100,9 @@ def test_merge_survives_the_resume_data_path(manager, tmp_path):
 def test_merged_trackers_reach_the_resume_file(manager):
     tid = manager.add_source(magnet(trackers=["udp://a:80"]))
     manager.add_source(magnet(trackers=["udp://b:80"]))
-    for _ in range(50):
-        manager.pump_alerts()
-        path = os.path.join(manager.store.directory, tid + ".resume")
-        if os.path.isfile(path):
-            break
-    saved = lt.read_resume_data(open(path, "rb").read())
+    path = wait_for_resume(manager, tid)
+    with open(path, "rb") as fh:
+        saved = lt.read_resume_data(fh.read())
     assert sorted(saved.trackers) == ["udp://a:80", "udp://b:80"]
 
 

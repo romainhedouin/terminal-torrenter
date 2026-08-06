@@ -379,7 +379,7 @@ class TorrenterApp(App[None]):
                 table.add_row(*cells, key=tid)
                 self.row_order.append(tid)
             else:
-                for col_key, value in zip(self.col_keys, cells):
+                for col_key, value in zip(self.col_keys, cells, strict=True):
                     # update_width=True lets columns grow to fit content so
                     # values like "1 d 20 h" are never clipped to "1 d".
                     table.update_cell(tid, col_key, value, update_width=True)

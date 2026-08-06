@@ -19,7 +19,7 @@ from dataclasses import asdict, dataclass, fields
 
 try:  # Python 3.11+
     import tomllib
-except ModuleNotFoundError:  # pragma: no cover - exercised on 3.9/3.10
+except ModuleNotFoundError:  # pragma: no cover - exercised on 3.10 only
     import tomli as tomllib  # type: ignore[no-redef]
 
 APP_NAME = "terminal-torrenter"
