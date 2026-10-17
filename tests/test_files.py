@@ -4,8 +4,11 @@ The tree helpers are exercised on plain data; the priority plumbing runs against
 a real multi-file torrent built on disk (no network).
 """
 
+import asyncio
+
 import libtorrent as lt
 import pytest
+from textual.app import App
 
 from terminal_torrenter.config import Config
 from terminal_torrenter.core import (
@@ -17,6 +20,7 @@ from terminal_torrenter.core import (
     build_file_tree,
     flatten_tree,
 )
+from terminal_torrenter.tui import FileSelectScreen
 
 PIECE_SIZE = 16 * 1024
 FILE_LAYOUT = (
@@ -250,3 +254,75 @@ def test_endpoint_prioritization_leaves_skipped_files_alone(manager, torrent_pat
     manager.ensure_endpoints_prioritized()
 
     assert handle.piece_priority(0) == FILE_PRIORITY_SKIP
+
+
+# -- the file-select screen -------------------------------------------------- #
+
+
+class _Host(App):
+    def __init__(self, manager, tid):
+        super().__init__()
+        self.manager, self.tid = manager, tid
+
+    async def on_mount(self):
+        await self.push_screen(FileSelectScreen(self.manager, self.tid))
+
+
+def drive_screen(manager, tid, keys):
+    """Press `keys` on a fresh file screen; return (visible row paths, cursor row)."""
+
+    async def run():
+        async with _Host(manager, tid).run_test(size=(100, 30)) as pilot:
+            await pilot.pause()
+            for key in keys:
+                await pilot.press(key)
+                await pilot.pause()
+            screen = pilot.app.screen
+            table = screen.query_one("#files_table")
+            return [row.path for row in screen.rows], table.cursor_row
+
+    return asyncio.run(run())
+
+
+def test_left_folds_and_right_unfolds_a_folder(manager, torrent_path):
+    tid = manager.add_source(torrent_path)
+    full, _ = drive_screen(manager, tid, [])
+    root = full[0]  # the torrent's top-level folder
+
+    folded, cursor = drive_screen(manager, tid, ["left"])
+    assert folded == [root] and cursor == 0
+
+    unfolded, _ = drive_screen(manager, tid, ["left", "right"])
+    assert unfolded == full
+
+
+def test_right_on_an_open_folder_steps_into_it(manager, torrent_path):
+    tid = manager.add_source(torrent_path)
+    full, _ = drive_screen(manager, tid, [])
+
+    paths, cursor = drive_screen(manager, tid, ["right"])
+    assert paths == full and cursor == 1  # first child of the open root folder
+
+
+def test_left_folds_an_open_folder_first_then_jumps_to_the_parent(manager, torrent_path):
+    tid = manager.add_source(torrent_path)
+    full, _ = drive_screen(manager, tid, [])
+    show = full[1]  # first child of the root: an open folder with children
+
+    paths, cursor = drive_screen(manager, tid, ["right", "left"])
+    assert cursor == 1 and paths == full[:2]  # folded in place, cursor stays on it
+
+    paths, cursor = drive_screen(manager, tid, ["right", "left", "left"])
+    assert cursor == 0 and show in paths  # already folded -> jump to the parent
+
+
+def test_arrows_do_nothing_on_a_file_except_left_to_the_parent(manager, torrent_path):
+    tid = manager.add_source(torrent_path)
+    full, _ = drive_screen(manager, tid, [])
+    last = len(full) - 1  # the last row is a file
+
+    paths, cursor = drive_screen(manager, tid, ["down"] * last + ["right"])
+    assert paths == full and cursor == last
+
+    paths, cursor = drive_screen(manager, tid, ["down"] * last + ["left"])
+    assert paths == full and full[cursor] == full[last].rsplit("/", 1)[0]

@@ -55,7 +55,8 @@ selected.
 | Key | Action |
 | --- | --- |
 | `space` | Select / skip the file or folder under the cursor |
-| `e` | Fold / unfold a folder |
+| `→` | Unfold the folder (or step into it if already open) |
+| `←` | Fold the folder (or jump to the parent folder from a file) |
 | `a` / `n` | Select everything / nothing |
 | `escape` | Back to the dashboard |
 

@@ -288,7 +288,8 @@ class FileSelectScreen(Screen):
     BINDINGS = [
         Binding("escape", "close", "Back"),
         Binding("space", "toggle", "Select/skip"),
-        Binding("e", "expand", "Fold/unfold"),
+        Binding("left", "fold", "Fold"),
+        Binding("right", "unfold", "Unfold"),
         Binding("a", "select_all", "All"),
         Binding("n", "select_none", "None"),
     ]
@@ -407,12 +408,33 @@ class FileSelectScreen(Screen):
         if node and self.manager.toggle_files_wanted(self.tid, node.indices):
             self.refresh_files()
 
-    def action_expand(self) -> None:
+    def _move_to(self, row: int) -> None:
+        self.query_one("#files_table", DataTable).move_cursor(row=row)
+
+    def action_fold(self) -> None:
+        """Collapse the folder under the cursor; on a file or an already
+        collapsed folder, jump to the parent folder instead."""
+        node = self._selected_node()
+        if not node:
+            return
+        if node.is_dir and node.path not in self.collapsed:
+            self.collapsed.add(node.path)
+            self.refresh_files()
+        elif "/" in node.path:
+            parent = node.path.rsplit("/", 1)[0]
+            self._move_to(next(i for i, row in enumerate(self.rows) if row.path == parent))
+
+    def action_unfold(self) -> None:
+        """Expand the folder under the cursor; if it is already open, step
+        into its first child."""
         node = self._selected_node()
         if not node or not node.is_dir:
             return
-        self.collapsed.symmetric_difference_update({node.path})
-        self.refresh_files()
+        if node.path in self.collapsed:
+            self.collapsed.discard(node.path)
+            self.refresh_files()
+        else:
+            self._move_to(self.query_one("#files_table", DataTable).cursor_row + 1)
 
     def action_select_all(self) -> None:
         if self.manager.set_all_files_wanted(self.tid, True):
