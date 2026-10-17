@@ -31,8 +31,10 @@ from .config import (
     write_default_config,
 )
 from .core import (
+    FileNode,
     InvalidSource,
     SessionManager,
+    flatten_tree,
     human_bytes,
     human_duration,
     rarity_level,
@@ -59,6 +61,17 @@ COLOR_DOWNLOADING = "#bfdbfe"  # pale blue: in progress
 COLOR_MISSING = "#3a3a3a"  # dark grey: not downloaded yet
 # Rarity levels 0..4 (rarest -> most common) for the optional overlay.
 RARITY_COLORS = {0: "#ef4444", 1: "#f97316", 2: "#eab308", 3: "#84cc16", 4: "#22c55e"}
+
+MARK_WANTED = "[✓]"
+MARK_SKIPPED = "[ ]"
+MARK_PARTIAL = "[~]"  # folder with only some of its files selected
+
+FILE_COLUMN_SPECS = (
+    ("Get", 5),
+    ("Name", 50),
+    ("Size", 11),
+    ("Done", 8),
+)
 
 # (label, initial width). Columns still auto-grow to fit longer content.
 COLUMN_SPECS = (
@@ -259,6 +272,159 @@ class PieceMapScreen(Screen):
         self.query_one("#legend", Static).update(legend)
 
 
+class FileSelectScreen(Screen):
+    """Pick which files and folders of a torrent to download.
+
+    Toggling a row applies immediately: deselected files get priority 0, so
+    libtorrent stops requesting them and the torrent's size, progress and ETA
+    count only what is still selected.
+    """
+
+    CSS = """
+    #files_summary { height: 1; padding: 0 1; color: $text; background: $panel; }
+    #files_table { height: 1fr; }
+    """
+
+    BINDINGS = [
+        Binding("escape", "close", "Back"),
+        Binding("space", "toggle", "Select/skip"),
+        Binding("e", "expand", "Fold/unfold"),
+        Binding("a", "select_all", "All"),
+        Binding("n", "select_none", "None"),
+    ]
+
+    def __init__(self, manager: SessionManager, tid: str) -> None:
+        super().__init__()
+        self.manager = manager
+        self.tid = tid
+        self.collapsed: set[str] = set()
+        self.rows: list[FileNode] = []
+        self.col_keys: list = []
+        self.cell_cache: dict[str, tuple[str, ...]] = {}  # node path -> cells shown
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static("", id="files_summary")
+        yield DataTable(id="files_table", cursor_type="row", zebra_stripes=True)
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.title = "Select files"
+        table = self.query_one("#files_table", DataTable)
+        self.col_keys = [
+            table.add_column(label, width=width) for label, width in FILE_COLUMN_SPECS
+        ]
+        table.focus()
+        self.refresh_files()
+        self.set_interval(1.0, self.refresh_files)
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+    # -- rendering ---------------------------------------------------------- #
+
+    def refresh_files(self) -> None:
+        tree = self.manager.file_tree(self.tid)
+        rows = flatten_tree(tree, self.collapsed)
+        table = self.query_one("#files_table", DataTable)
+
+        if not rows:
+            self.rows = []
+            table.clear()
+            self.query_one("#files_summary", Static).update(
+                "Waiting for metadata… the file list appears once it arrives."
+            )
+            return
+
+        wanted = {f.index: f.wanted for f in self.manager.files(self.tid)}
+        same_shape = [node.path for node in rows] == [node.path for node in self.rows]
+        self.rows = rows
+
+        if same_shape:
+            # Only touch cells whose text changed. The columns have fixed widths,
+            # so update_width stays off: with it, Textual re-measures the whole
+            # column for every narrower cell, which is O(rows²) per refresh.
+            for node in rows:
+                cells = self._cells(node, wanted)
+                if cells == self.cell_cache.get(node.path):
+                    continue
+                self.cell_cache[node.path] = cells
+                for col_key, value in zip(self.col_keys, cells, strict=True):
+                    table.update_cell(node.path, col_key, value)
+        else:
+            cursor = table.cursor_row
+            table.clear()
+            self.cell_cache = {}
+            for node in rows:
+                cells = self._cells(node, wanted)
+                self.cell_cache[node.path] = cells
+                table.add_row(*cells, key=node.path)
+            if cursor is not None and 0 <= cursor < len(rows):
+                table.move_cursor(row=cursor)
+
+        self._update_summary(wanted)
+
+    def _cells(self, node: FileNode, wanted: dict[int, bool]) -> tuple[str, ...]:
+        picked = sum(1 for index in node.indices if wanted.get(index, True))
+        if picked == 0:
+            mark = MARK_SKIPPED
+        elif picked == len(node.indices):
+            mark = MARK_WANTED
+        else:
+            mark = MARK_PARTIAL
+        prefix = "  " * node.depth
+        if node.is_dir:
+            prefix += "▸ " if node.path in self.collapsed else "▾ "
+        else:
+            prefix += "  "
+        return (
+            mark,
+            f"{prefix}{node.name}",
+            human_bytes(node.size),
+            f"{node.progress * 100:5.1f}%",
+        )
+
+    def _update_summary(self, wanted: dict[int, bool]) -> None:
+        picked_bytes, total_bytes = self.manager.selected_bytes(self.tid)
+        picked = sum(1 for is_wanted in wanted.values() if is_wanted)
+        self.query_one("#files_summary", Static).update(
+            f"{self.manager.label_for(self.tid)}  —  {picked}/{len(wanted)} files"
+            f"  •  {human_bytes(picked_bytes)} of {human_bytes(total_bytes)} selected"
+        )
+
+    # -- actions ------------------------------------------------------------ #
+
+    def _selected_node(self) -> FileNode | None:
+        if not self.rows:
+            return None
+        row = self.query_one("#files_table", DataTable).cursor_row
+        if row is None or row < 0 or row >= len(self.rows):
+            return None
+        return self.rows[row]
+
+    def action_toggle(self) -> None:
+        node = self._selected_node()
+        if node and self.manager.toggle_files_wanted(self.tid, node.indices):
+            self.refresh_files()
+
+    def action_expand(self) -> None:
+        node = self._selected_node()
+        if not node or not node.is_dir:
+            return
+        self.collapsed.symmetric_difference_update({node.path})
+        self.refresh_files()
+
+    def action_select_all(self) -> None:
+        if self.manager.set_all_files_wanted(self.tid, True):
+            self.refresh_files()
+            self.notify("All files selected.")
+
+    def action_select_none(self) -> None:
+        if self.manager.set_all_files_wanted(self.tid, False):
+            self.refresh_files()
+            self.notify("All files skipped — nothing will be downloaded.", severity="warning")
+
+
 # --------------------------------------------------------------------------- #
 # Main application
 # --------------------------------------------------------------------------- #
@@ -291,6 +457,7 @@ class TorrenterApp(App[None]):
         Binding("p", "pause", "Pause/Resume"),
         Binding("x", "remove", "Remove"),
         Binding("v", "view_pieces", "Piece map"),
+        Binding("f", "select_files", "Files"),
         Binding("c", "recheck", "Verify"),
         Binding("s", "toggle_sequential", "Sequential"),
         Binding("d", "limit_down", "DL limit"),
@@ -420,6 +587,17 @@ class TorrenterApp(App[None]):
         tid = self._selected_tid()
         if tid:
             self.push_screen(PieceMapScreen(self.manager, tid))
+
+    def action_select_files(self) -> None:
+        if isinstance(self.screen, FileSelectScreen):
+            return  # already open; don't stack another
+        tid = self._selected_tid()
+        if not tid:
+            return
+        if not self.manager.files(tid):
+            self.notify("No file list yet — still fetching metadata.", severity="warning")
+            return
+        self.push_screen(FileSelectScreen(self.manager, tid))
 
     def action_toggle_sequential(self) -> None:
         sequential = self.manager.toggle_sequential()

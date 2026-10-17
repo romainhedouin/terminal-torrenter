@@ -9,6 +9,7 @@ import json
 import os
 import time
 from collections import deque
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field, fields
 
 from .config import Config, state_dir
@@ -24,6 +25,8 @@ except ImportError as exc:  # pragma: no cover
 
 
 RESUME_SAVE_INTERVAL = 15  # seconds between fast-resume checkpoints
+FILE_PRIORITY_SKIP = 0  # libtorrent: "do not download this file"
+FILE_PRIORITY_NORMAL = 4  # libtorrent default file priority
 ETA_WINDOW_SECONDS = 10.0  # download-rate is averaged over this window for ETA
 
 
@@ -133,6 +136,115 @@ def info_hashes_to_id(info_hashes: lt.info_hash_t) -> str | None:
 
 
 # --------------------------------------------------------------------------- #
+# File selection
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class TorrentFile:
+    """One file inside a torrent, with its live download state."""
+
+    index: int
+    path: str  # path relative to the torrent root, "/"-separated
+    size: int
+    downloaded: int = 0
+    priority: int = FILE_PRIORITY_NORMAL
+
+    @property
+    def wanted(self) -> bool:
+        return self.priority > FILE_PRIORITY_SKIP
+
+    @property
+    def progress(self) -> float:
+        if self.size <= 0:
+            return 1.0
+        return min(1.0, self.downloaded / self.size)
+
+
+@dataclass
+class FileNode:
+    """A node in the torrent's directory tree (a file, or a folder of files)."""
+
+    name: str
+    path: str  # full path relative to the torrent root
+    is_dir: bool
+    depth: int
+    size: int = 0
+    downloaded: int = 0
+    file_index: int | None = None  # set on leaves only
+    indices: list[int] = field(default_factory=list)  # every file under this node
+    children: list[FileNode] = field(default_factory=list)
+
+    @property
+    def progress(self) -> float:
+        if self.size <= 0:
+            return 1.0
+        return min(1.0, self.downloaded / self.size)
+
+
+def build_file_tree(files: Iterable[TorrentFile]) -> list[FileNode]:
+    """Group flat torrent paths into a folder tree.
+
+    Folders sort before files, both alphabetically, and every folder carries the
+    aggregate size/progress plus the file indices beneath it so the UI can
+    toggle a whole folder in one keystroke.
+    """
+    roots: list[FileNode] = []
+    dirs: dict[str, FileNode] = {}
+
+    for entry in sorted(files, key=lambda f: f.path):
+        parts = [part for part in entry.path.split("/") if part]
+        if not parts:
+            continue
+        parent_children = roots
+        prefix = ""
+        for depth, part in enumerate(parts[:-1]):
+            prefix = f"{prefix}/{part}" if prefix else part
+            node = dirs.get(prefix)
+            if node is None:
+                node = FileNode(name=part, path=prefix, is_dir=True, depth=depth)
+                dirs[prefix] = node
+                parent_children.append(node)
+            node.size += entry.size
+            node.downloaded += entry.downloaded
+            node.indices.append(entry.index)
+            parent_children = node.children
+        leaf_path = f"{prefix}/{parts[-1]}" if prefix else parts[-1]
+        parent_children.append(
+            FileNode(
+                name=parts[-1],
+                path=leaf_path,
+                is_dir=False,
+                depth=len(parts) - 1,
+                size=entry.size,
+                downloaded=entry.downloaded,
+                file_index=entry.index,
+                indices=[entry.index],
+            )
+        )
+
+    def sort_nodes(nodes: list[FileNode]) -> None:
+        nodes.sort(key=lambda n: (not n.is_dir, n.name.lower()))
+        for node in nodes:
+            if node.children:
+                sort_nodes(node.children)
+
+    sort_nodes(roots)
+    return roots
+
+
+def flatten_tree(nodes: Iterable[FileNode], collapsed: set[str]) -> list[FileNode]:
+    """Depth-first list of visible rows: children of a collapsed folder are
+    hidden, but the folder itself is still shown."""
+    rows: list[FileNode] = []
+    for node in nodes:
+        rows.append(node)
+        if node.is_dir and node.path not in collapsed:
+            rows.extend(flatten_tree(node.children, collapsed))
+    return rows
+
+
+# --------------------------------------------------------------------------- #
 # Persistent state
 # --------------------------------------------------------------------------- #
 
@@ -226,6 +338,10 @@ class ManagedTorrent:
     sequential: bool
     display_name: str = ""
     paused: bool = False
+    # Mirror of the torrent's file priorities (index -> priority), including
+    # pad files. libtorrent applies prioritize_files() asynchronously, so its
+    # own getter lags a moment behind; this copy is what we read and write.
+    file_priorities: list[int] = field(default_factory=list)
 
 
 class InvalidSource(ValueError):
@@ -472,9 +588,116 @@ class SessionManager:
             if num_pieces <= 0:
                 continue
             for index in {0, num_pieces - 1}:
+                if managed.handle.piece_priority(index) == FILE_PRIORITY_SKIP:
+                    # The file that piece belongs to is deselected; forcing it
+                    # would drag in data the user asked us not to download.
+                    continue
                 managed.handle.piece_priority(index, 7)  # 7 = top priority
                 managed.handle.set_piece_deadline(index, 0)  # fetch ASAP
             self._ends_prioritized.add(tid)
+
+    # -- file selection ----------------------------------------------------- #
+
+    def files(self, tid: str) -> list[TorrentFile]:
+        """Every file in the torrent with its size, progress and priority.
+
+        Empty while the torrent's metadata is still being fetched (magnets).
+        """
+        managed = self.torrents.get(tid)
+        if not managed or not managed.handle.is_valid():
+            return []
+        info = managed.handle.torrent_file()
+        if info is None:
+            return []
+        storage = info.files()
+        priorities = self._file_priorities(managed, storage.num_files())
+        progress = list(managed.handle.file_progress())
+        result: list[TorrentFile] = []
+        for index in range(storage.num_files()):
+            if storage.file_flags(index) & lt.file_storage.flag_pad_file:
+                # Padding inserted by the torrent creator to align files; it has
+                # no user-visible path and libtorrent keeps it at priority 0.
+                continue
+            result.append(
+                TorrentFile(
+                    index=index,
+                    path=storage.file_path(index).replace(os.sep, "/"),
+                    size=storage.file_size(index),
+                    downloaded=progress[index] if index < len(progress) else 0,
+                    priority=int(priorities[index]) if index < len(priorities)
+                    else FILE_PRIORITY_NORMAL,
+                )
+            )
+        return result
+
+    def file_tree(self, tid: str) -> list[FileNode]:
+        """The torrent's files grouped into a folder tree."""
+        return build_file_tree(self.files(tid))
+
+    def _file_priorities(self, managed: ManagedTorrent, num_files: int) -> list[int]:
+        """The cached priority list, seeded from libtorrent on first use."""
+        if len(managed.file_priorities) != num_files:
+            managed.file_priorities = [int(p) for p in managed.handle.get_file_priorities()]
+        return managed.file_priorities
+
+    def set_files_wanted(self, tid: str, indices: Iterable[int], wanted: bool) -> bool:
+        """Select (download) or deselect (skip) the given file indices.
+
+        Deselected files get priority 0, which libtorrent honours by never
+        requesting their pieces; ``total_wanted`` shrinks accordingly, so the
+        progress bar and ETA reflect only what was picked. Returns False if the
+        torrent is unknown or has no metadata yet.
+        """
+        managed = self.torrents.get(tid)
+        if not managed or not managed.handle.is_valid():
+            return False
+        info = managed.handle.torrent_file()
+        if info is None:
+            return False
+        num_files = info.files().num_files()
+        priorities = self._file_priorities(managed, num_files)
+        target = FILE_PRIORITY_NORMAL if wanted else FILE_PRIORITY_SKIP
+        changed = False
+        for index in indices:
+            if 0 <= index < min(num_files, len(priorities)) and priorities[index] != target:
+                priorities[index] = target
+                changed = True
+        if not changed:
+            return True
+        managed.handle.prioritize_files(priorities)
+        # Checkpoint now: file priorities live in the resume data, so without
+        # this a restart before the next interval would download everything.
+        managed.handle.save_resume_data(lt.save_resume_flags_t.save_info_dict)
+        self._persist_meta(tid)
+        return True
+
+    def set_all_files_wanted(self, tid: str, wanted: bool) -> bool:
+        files = self.files(tid)
+        if not files:
+            return False
+        return self.set_files_wanted(tid, [f.index for f in files], wanted)
+
+    def toggle_files_wanted(self, tid: str, indices: Iterable[int]) -> bool:
+        """Flip a selection: anything partially selected becomes fully selected,
+        a fully selected group becomes deselected."""
+        indices = list(indices)
+        if not indices:
+            return False
+        priorities = {f.index: f.priority for f in self.files(tid)}
+        if not priorities:
+            return False
+        all_wanted = all(
+            priorities.get(i, FILE_PRIORITY_SKIP) > FILE_PRIORITY_SKIP for i in indices
+        )
+        return self.set_files_wanted(tid, indices, not all_wanted)
+
+    def selected_bytes(self, tid: str) -> tuple[int, int]:
+        """(bytes selected for download, total bytes in the torrent)."""
+        files = self.files(tid)
+        return (
+            sum(f.size for f in files if f.wanted),
+            sum(f.size for f in files),
+        )
 
     def recheck(self, tid: str) -> bool:
         """Force a full re-hash of the torrent's files against the piece
@@ -535,7 +758,14 @@ class SessionManager:
             if isinstance(alert, lt.save_resume_data_alert):
                 tid = info_hashes_to_id(alert.params.info_hashes)
                 if tid:
-                    self.store.save_resume(tid, lt.write_resume_data_buf(alert.params))
+                    params = alert.params
+                    managed = self.torrents.get(tid)
+                    if managed and managed.file_priorities:
+                        # A checkpoint requested right after a selection change
+                        # can be serialized before libtorrent has applied the
+                        # new priorities, so stamp in the ones we hold.
+                        params.file_priorities = list(managed.file_priorities)
+                    self.store.save_resume(tid, lt.write_resume_data_buf(params))
                     self._persist_meta(tid)
 
     def piece_state(self, tid: str) -> tuple[list[bool], set[int], list[int]]:

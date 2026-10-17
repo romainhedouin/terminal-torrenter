@@ -39,11 +39,31 @@ tt -d ~/Movies --max-download-rate 2048
 
 | Key | Action | | Key | Action |
 | --- | --- | --- | --- | --- |
-| `↑` `↓` | Select | | `v` | Piece heatmap (`r` toggles rarity) |
-| `a` | Add magnet / `.torrent` | | `c` | Verify (re-hash pieces on disk) |
-| `r` | Rename (label only) | | `s` | Toggle sequential download |
-| `p` | Pause / resume | | `d` `u` | Download / upload limit |
-| `x` | Remove (keeps files) | | `q` | Quit |
+| `↑` `↓` | Select | | `f` | Pick files / folders to download |
+| `a` | Add magnet / `.torrent` | | `v` | Piece heatmap (`r` toggles rarity) |
+| `r` | Rename (label only) | | `c` | Verify (re-hash pieces on disk) |
+| `p` | Pause / resume | | `s` | Toggle sequential download |
+| `x` | Remove (keeps files) | | `d` `u` | Download / upload limit |
+| | | | `q` | Quit |
+
+### Picking files
+
+Press `f` on a download to open its file tree. Folders show the aggregate size
+and progress of everything beneath them, and `[~]` marks a folder only partly
+selected.
+
+| Key | Action |
+| --- | --- |
+| `space` | Select / skip the file or folder under the cursor |
+| `e` | Fold / unfold a folder |
+| `a` / `n` | Select everything / nothing |
+| `escape` | Back to the dashboard |
+
+Changes apply immediately: skipped files are never requested from peers, and the
+download's size, progress and ETA count only what you kept. Nothing is deleted —
+re-select a file later and it downloads then. For a magnet the file list only
+exists once its metadata arrives, so `f` may say "still fetching metadata" for a
+few seconds after adding one.
 
 ## Configure
 
@@ -73,6 +93,9 @@ override either location outright.
 
 - Sequential mode is on by default, and the first and last piece of every
   torrent are always prioritised — handy for previewing media as it downloads.
+  Endpoints belonging to a skipped file are left alone.
+- File selections are stored in the torrent's resume data, so they survive a
+  restart.
 - Re-adding a magnet you already have merges any new trackers and web seeds into
   the existing torrent instead of discarding them. Private torrents (BEP 27) are
   deliberately left untouched.
