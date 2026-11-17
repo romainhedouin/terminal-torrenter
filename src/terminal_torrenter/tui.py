@@ -147,6 +147,48 @@ class TextPrompt(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+class LimitPrompt(ModalScreen[tuple[int | None, int] | None]):
+    """Two rate limits in one dialog: one for the selected download and one
+    for the whole session. Returns (torrent_kib, global_kib), with
+    torrent_kib None when no download is selected, or None if cancelled."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(
+        self, title: str, torrent_label: str | None, torrent_kib: int, global_kib: int
+    ) -> None:
+        super().__init__()
+        self.prompt = title
+        self.torrent_label = torrent_label
+        self.torrent_kib = torrent_kib
+        self.global_kib = global_kib
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(f"{self.prompt} in KiB/s (0 = unlimited)")
+            if self.torrent_label is not None:
+                yield Label(f"This download — “{self.torrent_label}”:", classes="field_label")
+                yield Input(value=str(self.torrent_kib), id="torrent_limit")
+            yield Label("All downloads (global):", classes="field_label")
+            yield Input(value=str(self.global_kib), id="global_limit")
+            yield Label("[b]tab[/b] Switch field    [b]enter[/b] Apply    [b]esc[/b] Cancel",
+                        id="hint")
+
+    def on_mount(self) -> None:
+        self.query(Input).first().focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        try:
+            values = {field.id: max(0, int(field.value.strip())) for field in self.query(Input)}
+        except ValueError:
+            self.notify("Please enter whole numbers.", severity="error")
+            return
+        self.dismiss((values.get("torrent_limit"), values["global_limit"]))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class ConfirmPrompt(ModalScreen[bool]):
     """Yes/No confirmation. Returns True/False."""
 
@@ -470,7 +512,9 @@ class TorrenterApp(App[None]):
         background: $surface;
     }
     #dialog Label { margin-bottom: 1; }
-    TextPrompt, ConfirmPrompt { align: center middle; }
+    #dialog .field_label { margin-bottom: 0; }
+    #dialog Input { margin-bottom: 1; }
+    TextPrompt, ConfirmPrompt, LimitPrompt { align: center middle; }
     """
 
     BINDINGS = [
@@ -534,8 +578,8 @@ class TorrenterApp(App[None]):
             self._status_text(managed, status),
             self._bar(status.progress),
             human_bytes(status.total_wanted) if status.total_wanted else "—",
-            f"{human_bytes(status.download_rate)}/s",
-            f"{human_bytes(status.upload_rate)}/s",
+            self._rate_text(status.download_rate, managed.dl_limit),
+            self._rate_text(status.upload_rate, managed.ul_limit),
             f"{status.num_peers}/{status.num_seeds}",
             human_duration(self.manager.eta_for(tid)),
         )
@@ -544,6 +588,12 @@ class TorrenterApp(App[None]):
         if managed.paused:
             return "paused"
         return STATE_LABELS.get(status.state, str(status.state))
+
+    @staticmethod
+    def _rate_text(rate: int, limit_kib: int) -> str:
+        """Current rate, with the download's own cap appended when it has one."""
+        text = f"{human_bytes(rate)}/s"
+        return f"{text} ≤{human_bytes(limit_kib * 1024)}" if limit_kib else text
 
     @staticmethod
     def _bar(progress: float, width: int = 10) -> str:
@@ -686,43 +736,49 @@ class TorrenterApp(App[None]):
         )
 
     def action_limit_down(self) -> None:
-        def done(value: str | None) -> None:
-            limit = self._parse_limit(value)
-            if limit is not None:
-                self.manager.set_download_limit(limit)
-                self.update_status_bar()
-                self.notify(f"Download limit: {limit or 'unlimited'} KiB/s")
-        self.push_screen(
-            TextPrompt(
-                "Download limit in KiB/s (0 = unlimited):",
-                initial=str(self.manager.dl_limit),
-            ),
-            done,
-        )
+        self._prompt_limits("down")
 
     def action_limit_up(self) -> None:
-        def done(value: str | None) -> None:
-            limit = self._parse_limit(value)
-            if limit is not None:
-                self.manager.set_upload_limit(limit)
-                self.update_status_bar()
-                self.notify(f"Upload limit: {limit or 'unlimited'} KiB/s")
+        self._prompt_limits("up")
+
+    def _prompt_limits(self, direction: str) -> None:
+        down = direction == "down"
+        noun = "Download" if down else "Upload"
+        tid = self._selected_tid()
+        managed = self.manager.torrents.get(tid) if tid else None
+
+        def done(result: tuple[int | None, int] | None) -> None:
+            if result is None:
+                return
+            torrent_kib, global_kib = result
+            if down:
+                self.manager.set_download_limit(global_kib)
+            else:
+                self.manager.set_upload_limit(global_kib)
+            parts = [f"global {self._limit_text(global_kib)}"]
+            if tid and torrent_kib is not None:
+                if down:
+                    self.manager.set_torrent_download_limit(tid, torrent_kib)
+                else:
+                    self.manager.set_torrent_upload_limit(tid, torrent_kib)
+                parts.insert(0, f"“{self.manager.label_for(tid)}” {self._limit_text(torrent_kib)}")
+            self.sync_rows()
+            self.update_status_bar()
+            self.notify(f"{noun} limit: " + ", ".join(parts))
+
         self.push_screen(
-            TextPrompt(
-                "Upload limit in KiB/s (0 = unlimited):",
-                initial=str(self.manager.ul_limit),
+            LimitPrompt(
+                f"{noun} limit",
+                self.manager.label_for(tid) if managed else None,
+                (managed.dl_limit if down else managed.ul_limit) if managed else 0,
+                self.manager.dl_limit if down else self.manager.ul_limit,
             ),
             done,
         )
 
-    def _parse_limit(self, value: str | None) -> int | None:
-        if value is None:
-            return None
-        try:
-            return max(0, int(value.strip()))
-        except ValueError:
-            self.notify("Please enter a whole number.", severity="error")
-            return None
+    @staticmethod
+    def _limit_text(kib: int) -> str:
+        return f"{kib} KiB/s" if kib else "unlimited"
 
     def action_quit(self) -> None:
         self.manager.shutdown()

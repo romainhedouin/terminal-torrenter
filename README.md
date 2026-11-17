@@ -46,6 +46,15 @@ tt -d ~/Movies --max-download-rate 2048
 | `x` | Remove (keeps files) | | `d` `u` | Download / upload limit |
 | | | | `q` | Quit |
 
+### Speed limits
+
+`d` and `u` open one dialog with two fields: a limit for the selected download
+and a global limit shared by every download (`tab` switches field, `enter`
+applies both). Values are KiB/s, `0` means unlimited. A download with its own cap
+shows it next to its rate (`1.2 MiB/s ≤300.0 KiB`), and whichever limit is lower
+wins. Per-download caps are saved with the download and survive a restart; the
+global limit lasts for the session (set a permanent one in the config file).
+
 ### Picking files
 
 Press `f` on a download to open its file tree. Folders show the aggregate size

@@ -258,6 +258,8 @@ class DownloadEntry:
     name: str = ""
     display_name: str = ""
     paused: bool = False
+    dl_limit: int = 0  # per-download limits in KiB/s, 0 = unlimited
+    ul_limit: int = 0
     progress: float = 0.0
     total_bytes: int = 0
     finished: bool = False
@@ -338,6 +340,8 @@ class ManagedTorrent:
     sequential: bool
     display_name: str = ""
     paused: bool = False
+    dl_limit: int = 0  # KiB/s, 0 = unlimited (the global limit still applies)
+    ul_limit: int = 0
     # Mirror of the torrent's file priorities (index -> priority), including
     # pad files. libtorrent applies prioritize_files() asynchronously, so its
     # own getter lags a moment behind; this copy is what we read and write.
@@ -440,6 +444,8 @@ class SessionManager:
             # torrent on startup despite it being saved as paused.
             params.flags |= lt.torrent_flags.paused
             params.flags &= ~lt.torrent_flags.auto_managed
+        params.download_limit = entry.dl_limit * 1024 or -1
+        params.upload_limit = entry.ul_limit * 1024 or -1
         handle = self.session.add_torrent(params)
         tid = info_hashes_to_id(handle.status().info_hashes) or entry.id
         self.torrents[tid] = ManagedTorrent(
@@ -448,6 +454,8 @@ class SessionManager:
             sequential=self.sequential,
             display_name=entry.display_name,
             paused=entry.paused,
+            dl_limit=entry.dl_limit,
+            ul_limit=entry.ul_limit,
         )
         if tid not in self.order:
             self.order.append(tid)
@@ -720,6 +728,26 @@ class SessionManager:
         self.ul_limit = max(0, kib_per_s)
         self.session.apply_settings({"upload_rate_limit": self.ul_limit * 1024})
 
+    def set_torrent_download_limit(self, tid: str, kib_per_s: int) -> bool:
+        """Cap one download on top of the global limit. Returns False for an
+        unknown torrent."""
+        managed = self.torrents.get(tid)
+        if not managed or not managed.handle.is_valid():
+            return False
+        managed.dl_limit = max(0, kib_per_s)
+        managed.handle.set_download_limit(managed.dl_limit * 1024 or -1)
+        self._persist_meta(tid)
+        return True
+
+    def set_torrent_upload_limit(self, tid: str, kib_per_s: int) -> bool:
+        managed = self.torrents.get(tid)
+        if not managed or not managed.handle.is_valid():
+            return False
+        managed.ul_limit = max(0, kib_per_s)
+        managed.handle.set_upload_limit(managed.ul_limit * 1024 or -1)
+        self._persist_meta(tid)
+        return True
+
     # -- persistence -------------------------------------------------------- #
 
     def label_for(self, tid: str) -> str:
@@ -742,6 +770,8 @@ class SessionManager:
             name=status.name or "",
             display_name=managed.display_name,
             paused=managed.paused,
+            dl_limit=managed.dl_limit,
+            ul_limit=managed.ul_limit,
             progress=status.progress,
             total_bytes=status.total_wanted,
             finished=bool(status.is_finished or status.is_seeding),

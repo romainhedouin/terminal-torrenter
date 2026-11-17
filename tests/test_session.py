@@ -103,3 +103,42 @@ def test_endpoint_prioritization_is_idempotent(manager, torrent_path):
     handle = manager.torrents[tid].handle
     assert handle.piece_priority(0) == TOP_PRIORITY
     assert handle.piece_priority(handle.torrent_file().num_pieces() - 1) == TOP_PRIORITY
+
+
+def test_per_torrent_limits_apply_and_survive_restart(manager, torrent_path, tmp_path):
+    tid = manager.add_source(torrent_path)
+
+    assert manager.set_torrent_download_limit(tid, 300)
+    assert manager.set_torrent_upload_limit(tid, 50)
+    handle = manager.torrents[tid].handle
+    assert handle.download_limit() == 300 * 1024
+    assert handle.upload_limit() == 50 * 1024
+    # The global limits are untouched.
+    assert manager.dl_limit == 0 and manager.ul_limit == 0
+
+    manager.session.pause()
+    restarted = SessionManager(
+        Config(download_dir=str(tmp_path / "out"), listen_port=6902),
+        store=TorrentStore(str(tmp_path / "state")),
+    )
+    restarted.load_existing()
+    try:
+        managed = restarted.torrents[tid]
+        assert (managed.dl_limit, managed.ul_limit) == (300, 50)
+        assert managed.handle.download_limit() == 300 * 1024
+        assert managed.handle.upload_limit() == 50 * 1024
+    finally:
+        restarted.session.pause()
+
+
+def test_per_torrent_limit_zero_means_unlimited(manager, torrent_path):
+    tid = manager.add_source(torrent_path)
+    manager.set_torrent_download_limit(tid, 300)
+    manager.set_torrent_download_limit(tid, 0)
+    assert manager.torrents[tid].dl_limit == 0
+    assert manager.torrents[tid].handle.download_limit() <= 0
+
+
+def test_per_torrent_limit_unknown_torrent_is_noop(manager):
+    assert manager.set_torrent_download_limit("nope", 100) is False
+    assert manager.set_torrent_upload_limit("nope", 100) is False
